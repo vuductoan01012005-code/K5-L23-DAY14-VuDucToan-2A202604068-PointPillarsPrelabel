@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 14 bonus – Chạy PointPillars bên trong CVAT</title>
+<style>
+  :root { --fg:#1d2433; --muted:#5b6475; --bg:#fbfbfd; --card:#fff; --line:#e3e6ee; --accent:#2f6fdf; --warn:#b5530b; --warnbg:#fff6ec; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width:860px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:1.7rem; margin:0 0 4px; }
+  h2 { font-size:1.2rem; margin:36px 0 8px; padding-top:12px; border-top:1px solid var(--line); }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  pre { background:#141a26; color:#e6e9ef; padding:14px 16px; border-radius:8px; overflow-x:auto; font-size:.88rem; line-height:1.5; }
+  code { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:.9em; }
+  p code, li code, td code { background:#eef1f7; padding:1px 5px; border-radius:4px; }
+  .note { background:var(--warnbg); border-left:4px solid var(--warn); padding:10px 14px; border-radius:6px; margin:14px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 18px; margin:14px 0; }
+  table { border-collapse:collapse; width:100%; margin:10px 0; font-size:.95rem; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:#f2f4f9; }
+  nav ol { margin:6px 0; padding-left:22px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>Chạy PointPillars bên trong CVAT (Hướng 2, tối đa +3)</h1>
+<p class="sub">Bonus Day 14, tùy chọn. Làm tối đa 45 phút. Hết giờ mà chưa chạy được thì nộp báo cáo vướng mắc (+1).</p>
+
+<div class="card">
+<b>Mục tiêu:</b> CVAT tự sinh cuboid cho task 3D của bạn bằng một serverless function (Nuclio) bọc PointPillars, rồi so số box đó với <code>pred_*.json</code> chạy offline.
+<nav><ol>
+  <li><a href="#s1">Bật serverless cho CVAT Docker đang chạy</a></li>
+  <li><a href="#s2">Viết function</a></li>
+  <li><a href="#s3">Deploy</a></li>
+  <li><a href="#s4">Gọi qua API (UI không cho chọn model cho task 3D)</a></li>
+  <li><a href="#s5">Kiểm tra và so khớp với kết quả offline</a></li>
+  <li><a href="#s6">Lỗi hay gặp</a></li>
+</ol></nav>
+</div>
+
+<div class="note">
+<b>An toàn:</b> dashboard Nuclio (cổng 8070) không có đăng nhập. Chỉ bind vào <code>127.0.0.1</code>, không mở ra mạng.
+</div>
+
+<h2 id="s1">1. Bật serverless cho CVAT</h2>
+<p>Bạn đã chạy CVAT bằng Docker cho phần bắt buộc. Trong đúng thư mục <code>cvat</code> đó, chạy lại kèm file serverless để có Nuclio (dữ liệu và task cũ vẫn giữ nguyên):</p>
+<pre><code>docker compose -f docker-compose.yml \
+  -f components/serverless/docker-compose.serverless.yml up -d</code></pre>
+<p>Cài <code>nuctl</code> đúng phiên bản dashboard (xem tag image <code>quay.io/nuclio/dashboard</code> trong file serverless compose). Mac Apple Silicon: dùng image dashboard có hậu tố <code>-arm64</code> để function build native, nhanh hơn nhiều so với giả lập amd64.</p>
+<p>Dùng luôn task 3D đã tạo ở phần bắt buộc (hoặc tạo task mới bằng <code>scripts/vf_cvat.py</code>) và ghi lại <b>task id</b>.</p>
+
+<h2 id="s2">2. Viết function</h2>
+<p>Một thư mục gồm <code>function.yaml</code>, <code>main.py</code> và bản sao thư mục <code>vf_pp/</code> cùng trọng số. Nuclio chỉ build những gì nằm trong thư mục này.</p>
+
+<h3>Input CVAT gửi sang</h3>
+<p>Với task 3D, CVAT gửi file PCD của frame, mã hóa base64 trong <code>body["image"]</code>. PCD của lab có các trường <code>x y z rgb</code> dạng binary. Kênh <code>rgb</code> chứa mức xám đã nén log của intensity (xem <code>vf_common.intensity_gray</code>), nên bạn phải tự đảo ngược hàm đó để có lại intensity xấp xỉ. Không đảo thì model vẫn chạy nhưng sẽ ra ít box hơn.</p>
+
+<h3>Output phải trả về</h3>
+<pre><code>[{"type": "cuboid", "label": "Car", "confidence": "0.81",
+  "points": [x, y, z, 0, 0, yaw, length, width, height, 0, 0, 0, 0, 0, 0, 0]}]</code></pre>
+<p>Mảng <code>points</code> có đúng 16 số: tâm, góc xoay (radian, quay quanh trục z), kích thước, cộng 7 số 0 đệm. Tên label phải trùng với label của task.</p>
+
+<h3>Khung <code>main.py</code></h3>
+<pre><code>import base64, json
+from vf_pp.core import Config, Detector
+
+def init_context(context):
+    context.user_data.detector = Detector(Config())   # nạp model 1 lần
+
+def handler(context, event):
+    body = event.body if isinstance(event.body, dict) else json.loads(event.body)
+    points = parse_pcd(base64.b64decode(body["image"]))  # (N, 4): x y z intensity — tự viết
+    boxes = context.user_data.detector.detect(points)
+    results = [...]                                       # đổi mỗi box sang dict cuboid như trên
+    return context.Response(body=json.dumps(results), content_type="application/json",
+                            status_code=200)</code></pre>
+
+<h3>Phần chính của <code>function.yaml</code></h3>
+<pre><code>metadata:
+  name: pp-&lt;ID&gt;
+  namespace: nuclio
+  annotations:
+    name: PointPillars &lt;ID&gt;
+    type: detector
+    supported_shape_types: cuboid
+    spec: |
+      [{"id": 1, "name": "Car", "type": "cuboid"},
+       {"id": 2, "name": "Pedestrian", "type": "cuboid"}]   # khớp label của task
+spec:
+  runtime: python:3.10
+  handler: main:handler
+  eventTimeout: 120s
+  build:
+    baseImage: python:3.10-slim
+    directives:
+      preCopy:
+        - kind: RUN
+          value: pip install --no-cache-dir numpy torch --extra-index-url https://download.pytorch.org/whl/cpu
+  triggers:
+    myHttpTrigger:
+      kind: http
+      numWorkers: 1
+      attributes:
+        maxRequestBodySize: 33554432   # PCD lớn hơn mặc định 4 MB</code></pre>
+
+<h2 id="s3">3. Deploy</h2>
+<pre><code>nuctl create project cvat --platform local
+nuctl deploy --project-name cvat --path ./my-function \
+  --file ./my-function/function.yaml --platform local
+nuctl get functions --platform local     # cột STATE phải là "ready"</code></pre>
+<p>Vào CVAT, mở trang <b>Models</b>: function của bạn phải xuất hiện ở đó. Nếu không thấy, xem log container <code>cvat_server</code> và <code>nuclio</code>.</p>
+
+<h2 id="s4">4. Gọi qua API</h2>
+<p>Hộp thoại Automatic annotation khóa ô chọn model với task 3D và báo "No models available". Một PR mở khóa ô này đã bị CVAT từ chối vì khi đó danh sách sẽ hiện cả model 2D (YOLO, SAM...). Vì vậy hãy gọi thẳng API:</p>
+<pre><code>curl -u &lt;user&gt;:&lt;pass&gt; -H "Content-Type: application/json" \
+  -X POST http://localhost:8080/api/lambda/requests \
+  -d '{"function": "pp-&lt;ID&gt;", "task": &lt;task_id&gt;, "threshold": 0.3, "cleanup": true}'
+
+# theo dõi tiến độ (dùng id trả về ở lệnh trên)
+curl -u &lt;user&gt;:&lt;pass&gt; http://localhost:8080/api/lambda/requests/&lt;request_id&gt;</code></pre>
+<p>Thay <code>&lt;user&gt;:&lt;pass&gt;</code> bằng tài khoản CVAT local của bạn. Đừng dán mật khẩu vào báo cáo hay video.</p>
+
+<h2 id="s5">5. Kiểm tra và so khớp</h2>
+<ol>
+  <li>Mở job: cuboid phải nằm đúng vị trí trên đám mây điểm. Quay video ngắn màn hình.</li>
+  <li>Lấy cuboid ra qua <code>GET /api/jobs/&lt;job_id&gt;/annotations</code>. Không nên dựa vào export, vì cuboid dạng shape có thể bị thiếu khi export (<a href="https://github.com/cvat-ai/cvat/issues/9144">cvat#9144</a>). Nếu có export thì kiểm tra lại file.</li>
+  <li>So với <code>pred_*.json</code> offline: đếm số box của CVAT có tâm cách một box offline cùng label không quá <b>0,5 m</b>. Ghi rõ cả hai tổng số.</li>
+</ol>
+<table>
+  <tr><th>Frame</th><th>Box CVAT</th><th>Box offline</th><th>Trùng tâm ≤ 0,5 m</th><th>Ghi chú</th></tr>
+  <tr><td>…</td><td>…</td><td>…</td><td>…</td><td>vd. lệch do intensity xấp xỉ</td></tr>
+</table>
+<p>Lệch nhỏ là bình thường, vì intensity khôi phục từ PCD chỉ là xấp xỉ. Đừng viết là pipeline "giống hệt" nếu số không khớp hoàn toàn.</p>
+
+<h2 id="s6">6. Lỗi hay gặp</h2>
+<table>
+  <tr><th>Triệu chứng</th><th>Thử</th></tr>
+  <tr><td>Function không hiện trong trang Models</td><td>Kiểm tra <code>namespace: nuclio</code>, đúng <code>--project-name cvat</code>, và CVAT được chạy kèm file serverless compose.</td></tr>
+  <tr><td>Request báo 413 / body too large</td><td>Tăng <code>maxRequestBodySize</code>.</td></tr>
+  <tr><td>Timeout ở frame đầu</td><td>Lần đầu phải nạp model. Tăng <code>eventTimeout</code>, hoặc nạp model trong <code>init_context</code>.</td></tr>
+  <tr><td>Build pip lỗi trên Mac arm64</td><td>Dùng dashboard <code>-arm64</code>. Nếu thiếu wheel thì <code>pip download</code> sẵn trong <code>preCopy</code>.</td></tr>
+  <tr><td>Chạy xong nhưng 0 cuboid</td><td>Label trong <code>spec</code> không khớp label của task, hoặc threshold quá cao, hoặc quên đảo intensity.</td></tr>
+  <tr><td>Box lệch hoặc xoay sai</td><td>Kiểm tra thứ tự 16 số và đơn vị góc (radian).</td></tr>
+</table>
+
+<h2>Nộp gì</h2>
+<ul>
+  <li><b>+3:</b> video ngắn, bảng so khớp ở mục 5, và đường dẫn tới thư mục function của bạn.</li>
+  <li><b>+1:</b> nếu chưa chạy được thì nộp các bước đã làm, bước bị vướng, log lỗi, và việc sẽ thử tiếp.</li>
+</ul>
+</main>
+</body>
+</html>

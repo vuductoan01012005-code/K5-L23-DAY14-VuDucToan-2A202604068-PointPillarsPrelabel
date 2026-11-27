@@ -1,0 +1,11 @@
+third_party/
+d14_*/png_*/
+out/
+nop/
+xem/
+__pycache__/
+.venv/
+*.zip
+.env
+Data-VF/
+data-VF/

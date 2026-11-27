@@ -1,0 +1,14 @@
+.git/
+.venv/
+third_party/
+d14_*/
+out/
+nop/
+xem/
+__pycache__/
+*.zip
+.env
+Data-VF/
+data-VF/
+**/Data-VF/
+**/data-VF/

@@ -1,0 +1,7 @@
+# 6 frame chung cho buổi giảng Day 14 (chỉ số đếm từ 0, giống Day 13)
+s02f07
+s03f15
+s05f40
+s01f39
+s03f18
+s05f09
